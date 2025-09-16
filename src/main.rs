@@ -14,7 +14,14 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Only check the root directory
+    /// Starting directory to check (default: .)
+    #[arg(long, default_value = ".")]
+    start_path: String,
+
+    #[arg(long, default_value = "packages.txt")]
+    package_file: String,
+
+    /// Only check the start directory
     #[arg(long)]
     root_only: bool,
 
@@ -27,7 +34,7 @@ struct Args {
     jobs: usize,
 
     /// Skip calling npm (fast)
-    #[arg(long = "no-npm")]
+    #[arg(long = "no-npm", default_value = "true")]
     no_npm: bool,
 
     /// Verbose logging (debug)
@@ -40,6 +47,7 @@ struct Preload {
     plock: Option<Value>,
     pnpm: Option<String>,
     deps: Option<String>,
+    pkg_json: Option<Value>,
 }
 
 fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
@@ -50,9 +58,8 @@ fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
         "pnpm-lock.yaml",
         "pnpm-workspace.yaml",
         "DEPENDENCIES.json",
-        "packages.txt",
     ];
-    let exclude_dirs = vec![".nx", "node_modules"];
+    let exclude_dirs = vec![".nx"];
     let mut dirs: HashSet<String> = HashSet::new();
 
     for entry in WalkDir::new(root)
@@ -69,18 +76,7 @@ fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
             if patterns.contains(&file_name) {
                 if let Some(parent) = entry.path().parent() {
                     let dir_str = parent.to_str().unwrap_or(".").to_string();
-                    if !dir_str.contains("/node_modules/") && !dir_str.contains("/.nx/") {
-                        // Only include directories with packages.txt and at least one other relevant file
-                        let parent_path = Path::new(&dir_str);
-                        let has_packages = parent_path.join("packages.txt").is_file();
-                        let has_other = patterns
-                            .iter()
-                            .filter(|&&p| p != "packages.txt")
-                            .any(|p| parent_path.join(p).is_file());
-                        if has_packages && has_other {
-                            dirs.insert(dir_str);
-                        }
-                    }
+                    dirs.insert(dir_str);
                 }
             }
         }
@@ -89,23 +85,15 @@ fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
     if root_only {
         let root_str = root.to_str().unwrap_or(".").to_string();
         let root_path = Path::new(&root_str);
-        let has_packages = root_path.join("packages.txt").is_file();
-        let has_other = patterns
-            .iter()
-            .filter(|&&p| p != "packages.txt")
-            .any(|p| root_path.join(p).is_file());
-        if has_packages && has_other {
+        let has_relevant_file = patterns.iter().any(|p| root_path.join(p).is_file());
+        if has_relevant_file {
             dirs.insert(root_str);
         }
     } else {
-        let root_str = ".".to_string();
+        let root_str = root.to_str().unwrap_or(".").to_string();
         let root_path = Path::new(&root_str);
-        let has_packages = root_path.join("packages.txt").is_file();
-        let has_other = patterns
-            .iter()
-            .filter(|&&p| p != "packages.txt")
-            .any(|p| root_path.join(p).is_file());
-        if has_packages && has_other {
+        let has_relevant_file = patterns.iter().any(|p| root_path.join(p).is_file());
+        if has_relevant_file {
             dirs.insert(root_str);
         }
     }
@@ -115,34 +103,13 @@ fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
     sorted_dirs
 }
 
-fn parse_version(v: &str) -> Option<(i32, i32, i32)> {
-    let re = Regex::new(r"^\d+\.\d+\.\d+").unwrap();
-    re.captures(v).map(|cap| {
-        let parts: Vec<i32> = cap[0]
-            .split('.')
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-        (parts[0], parts[1], parts[2])
-    })
-}
-
-fn get_pkg_range(dirpath: &str, name: &str) -> String {
-    let pj_path = Path::new(dirpath).join("package.json");
-    if !pj_path.is_file() {
-        return String::new();
-    }
-    let file = match File::open(pj_path) {
-        Ok(f) => f,
-        _ => return String::new(),
-    };
-    let data: Value = match serde_json::from_reader(file) {
-        Ok(d) => d,
-        _ => return String::new(),
-    };
-    for section in ["dependencies", "devDependencies", "peerDependencies"] {
-        if let Some(deps) = data.get(section).and_then(|d| d.as_object()) {
-            if let Some(r) = deps.get(name).and_then(|r| r.as_str()) {
-                return r.to_string();
+fn get_pkg_range(name: &str, pkg_json: Option<&Value>) -> String {
+    if let Some(data) = pkg_json {
+        for section in ["dependencies", "devDependencies", "peerDependencies"] {
+            if let Some(deps) = data.get(section).and_then(|d| d.as_object()) {
+                if let Some(r) = deps.get(name).and_then(|r| r.as_str()) {
+                    return r.to_string();
+                }
             }
         }
     }
@@ -307,22 +274,61 @@ fn main() -> io::Result<()> {
 
     println!("Checking for npm packages and lockfile/package.json/DEPENDENCIES.json compatibility in this project and subfolders...");
 
-    let dirs = find_dirs(Path::new("."), args.root_only);
+    let start_path = Path::new(&args.start_path);
+    let dirs = find_dirs(start_path, args.root_only);
 
     eprintln!("Directories to be checked:");
     for d in &dirs {
         eprintln!("  {}", d);
     }
+
     if args.list_dirs {
         return Ok(());
     }
 
     if dirs.is_empty() {
-        eprintln!("[warning] No directories found with both packages.txt and at least one other relevant file (package.json, yarn.lock, etc.)");
+        eprintln!("[warning] No directories found with relevant files (package.json, yarn.lock, etc.)");
         return Ok(());
     }
 
-    // Preload lock files
+    // Read packages.txt from start_path
+    let packages_file_path = Path::new(&args.package_file);
+    let packages_file = match File::open(&packages_file_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("[error] Failed to open packages.txt at {}: {}", packages_file_path.display(), e);
+            return Ok(());
+        }
+    };
+    let packages: Vec<(String, String)> = BufReader::new(packages_file)
+        .lines()
+        .filter_map(|line| {
+            if let Ok(l) = line {
+                let parts: Vec<&str> = l.trim().split('@').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    if args.verbose {
+                        eprintln!("[warning] Invalid line in packages.txt: {}", l);
+                    }
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if packages.is_empty() {
+        eprintln!("[error] No valid packages found in packages.txt at {}", packages_file_path.display());
+        return Ok(());
+    }
+
+    if args.verbose {
+        eprintln!("[debug] Loaded {} packages from packages.txt", packages.len());
+    }
+
+    // Preload lock files and package.json
     let mut preloads: HashMap<String, Preload> = HashMap::new();
     for d in &dirs {
         let mut preload = Preload {
@@ -330,6 +336,7 @@ fn main() -> io::Result<()> {
             plock: None,
             pnpm: None,
             deps: None,
+            pkg_json: None,
         };
         let dir_path = Path::new(d);
         if let Ok(content) = fs::read_to_string(dir_path.join("yarn.lock")) {
@@ -349,11 +356,19 @@ fn main() -> io::Result<()> {
         if let Ok(content) = fs::read_to_string(dir_path.join("DEPENDENCIES.json")) {
             preload.deps = Some(content);
         }
+        let pj_path = dir_path.join("package.json");
+        if pj_path.is_file() {
+            if let Ok(file) = File::open(&pj_path) {
+                if let Ok(value) = serde_json::from_reader(file) {
+                    preload.pkg_json = Some(value);
+                }
+            }
+        }
         preloads.insert(d.clone(), preload);
     }
 
     if args.verbose {
-        eprintln!("[debug] Preloaded lockfiles for {} directories", preloads.len());
+        eprintln!("[debug] Preloaded lockfiles and package.json for {} directories", preloads.len());
     }
 
     // Prepare for parallel processing
@@ -362,44 +377,8 @@ fn main() -> io::Result<()> {
 
     dirs.par_iter().for_each(|d| {
         let preload = preloads.get(d).unwrap();
-        // Read packages.txt for this directory
-        let packages_file = match File::open(Path::new(d).join("packages.txt")) {
-            Ok(file) => file,
-            Err(e) => {
-                if args.verbose {
-                    eprintln!("[debug] Skipping directory {}: Failed to open packages.txt: {}", d, e);
-                }
-                return;
-            }
-        };
-        let packages: Vec<(String, String)> = BufReader::new(packages_file)
-            .lines()
-            .filter_map(|line| {
-                if let Ok(l) = line {
-                    let parts: Vec<&str> = l.trim().split('@').collect();
-                    if parts.len() == 2 {
-                        Some((parts[0].to_string(), parts[1].to_string()))
-                    } else {
-                        if args.verbose {
-                            eprintln!("[warning] Invalid line in packages.txt in {}: {}", d, l);
-                        }
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if packages.is_empty() {
-            if args.verbose {
-                eprintln!("[debug] No valid packages found in packages.txt in {}", d);
-            }
-            return;
-        }
-
         for (name, version) in &packages {
-            let rng = get_pkg_range(d, name);
+            let rng = get_pkg_range(name, preload.pkg_json.as_ref());
             let mut versions_by_file: HashMap<String, HashSet<String>> = HashMap::new();
 
             if let Some(content) = &preload.yarn {
