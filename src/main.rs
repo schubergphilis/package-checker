@@ -18,6 +18,7 @@ struct Args {
     #[arg(long, default_value = ".")]
     start_path: String,
 
+    /// Package file to read (default: packages.txt)
     #[arg(long, default_value = "packages.txt")]
     package_file: String,
 
@@ -34,7 +35,7 @@ struct Args {
     jobs: usize,
 
     /// Skip calling npm (fast)
-    #[arg(long = "no-npm", default_value = "true")]
+    #[arg(long = "no-npm")]
     no_npm: bool,
 
     /// Verbose logging (debug)
@@ -50,15 +51,44 @@ struct Preload {
     pkg_json: Option<Value>,
 }
 
+fn parse_version(v: &str) -> Option<(i32, i32, i32)> {
+    let re = Regex::new(r"^\d+\.\d+\.\d+").unwrap();
+    re.captures(v).map(|cap| {
+        let parts: Vec<i32> = cap[0]
+            .split('.')
+            .map(|s| s.parse().unwrap_or(0))
+            .collect();
+        (parts[0], parts[1], parts[2])
+    })
+}
+
+fn satisfies_range(version: &str, range: &str) -> bool {
+    let version = version.trim_start_matches('^').trim_start_matches('~');
+    if let Some((v_major, v_minor, v_patch)) = parse_version(version) {
+        if range.starts_with('^') {
+            let range_version = range.trim_start_matches('^');
+            if let Some((r_major, r_minor, _)) = parse_version(range_version) {
+                v_major == r_major && (v_minor > r_minor || (v_minor == r_minor && v_patch >= 0))
+            } else {
+                false
+            }
+        } else if range.starts_with('~') {
+            let range_version = range.trim_start_matches('~');
+            if let Some((r_major, r_minor, r_patch)) = parse_version(range_version) {
+                v_major == r_major && v_minor == r_minor && v_patch >= r_patch
+            } else {
+                false
+            }
+        } else {
+            version == range
+        }
+    } else {
+        false
+    }
+}
+
 fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
-    let patterns = vec![
-        "package.json",
-        "yarn.lock",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "pnpm-workspace.yaml",
-        "DEPENDENCIES.json",
-    ];
+    let patterns = vec!["package.json"];
     let exclude_dirs = vec![".nx"];
     let mut dirs: HashSet<String> = HashSet::new();
 
@@ -105,7 +135,7 @@ fn find_dirs(root: &Path, root_only: bool) -> Vec<String> {
 
 fn get_pkg_range(name: &str, pkg_json: Option<&Value>) -> String {
     if let Some(data) = pkg_json {
-        for section in ["dependencies", "devDependencies", "peerDependencies"] {
+        for section in ["dependencies", "devDependencies"] {
             if let Some(deps) = data.get(section).and_then(|d| d.as_object()) {
                 if let Some(r) = deps.get(name).and_then(|r| r.as_str()) {
                     return r.to_string();
@@ -287,20 +317,20 @@ fn main() -> io::Result<()> {
     }
 
     if dirs.is_empty() {
-        eprintln!("[warning] No directories found with relevant files (package.json, yarn.lock, etc.)");
+        eprintln!("[warning] No directories found with package.json");
         return Ok(());
     }
 
-    // Read packages.txt from start_path
+    // Read package file from start_path
     let packages_file_path = Path::new(&args.package_file);
     let packages_file = match File::open(&packages_file_path) {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("[error] Failed to open packages.txt at {}: {}", packages_file_path.display(), e);
+            eprintln!("[error] Failed to open {} at {}: {}", args.package_file, packages_file_path.display(), e);
             return Ok(());
         }
     };
-    let packages: Vec<(String, String)> = BufReader::new(packages_file)
+    let packages: HashSet<(String, String)> = BufReader::new(packages_file)
         .lines()
         .filter_map(|line| {
             if let Ok(l) = line {
@@ -309,7 +339,7 @@ fn main() -> io::Result<()> {
                     Some((parts[0].to_string(), parts[1].to_string()))
                 } else {
                     if args.verbose {
-                        eprintln!("[warning] Invalid line in packages.txt: {}", l);
+                        eprintln!("[warning] Invalid line in {}: {}", args.package_file, l);
                     }
                     None
                 }
@@ -320,12 +350,12 @@ fn main() -> io::Result<()> {
         .collect();
 
     if packages.is_empty() {
-        eprintln!("[error] No valid packages found in packages.txt at {}", packages_file_path.display());
+        eprintln!("[error] No valid packages found in {} at {}", args.package_file, packages_file_path.display());
         return Ok(());
     }
 
     if args.verbose {
-        eprintln!("[debug] Loaded {} packages from packages.txt", packages.len());
+        eprintln!("[debug] Loaded {} packages from {}", packages.len(), args.package_file);
     }
 
     // Preload lock files and package.json
@@ -372,13 +402,101 @@ fn main() -> io::Result<()> {
     }
 
     // Prepare for parallel processing
-    let rows_mutex: Mutex<Vec<(String, String, String, bool, bool)>> = Mutex::new(Vec::new());
+    let rows_mutex: Mutex<Vec<(String, String, String, bool, bool, String, String)>> = Mutex::new(Vec::new());
     let found_mutex: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     dirs.par_iter().for_each(|d| {
         let preload = preloads.get(d).unwrap();
+        let pkg_json = preload.pkg_json.as_ref();
+
+        // Process main package from package.json
+        if let Some(data) = pkg_json {
+            let name = data.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let version = data.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.is_empty() && !version.is_empty() {
+                let match_package = packages.iter().any(|(pkg_name, _)| pkg_name == name);
+                let match_version = packages.contains(&(name.to_string(), version.to_string()));
+
+                rows_mutex.lock().unwrap().push((
+                    name.to_string(),
+                    version.to_string(),
+                    d.to_string(),
+                    match_package,
+                    match_version,
+                    String::new(),
+                    String::new(),
+                ));
+
+                if match_package && match_version {
+                    found_mutex
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:{}@{}", d, name, version));
+                }
+
+                // Process dependencies
+                if let Some(deps) = data.get("dependencies").and_then(|d| d.as_object()) {
+                    for (dep_name, dep_version) in deps {
+                        let dep_version = dep_version.as_str().unwrap_or("");
+                        let dep_version_clean = dep_version.trim_start_matches('^').trim_start_matches('~');
+                        let match_package = packages.iter().any(|(pkg_name, _)| pkg_name == dep_name);
+                        let match_version = packages.iter().any(|(pkg_name, pkg_version)| {
+                            pkg_name == dep_name && satisfies_range(dep_version_clean, pkg_version)
+                        });
+
+                        rows_mutex.lock().unwrap().push((
+                            dep_name.to_string(),
+                            dep_version_clean.to_string(),
+                            d.to_string(),
+                            match_package,
+                            match_version,
+                            "yes".to_string(),
+                            format!("{}@{}", name, version),
+                        ));
+
+                        if match_package && match_version {
+                            found_mutex
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}:{}@{}", d, dep_name, dep_version_clean));
+                        }
+                    }
+                }
+
+                // Process devDependencies
+                if let Some(deps) = data.get("devDependencies").and_then(|d| d.as_object()) {
+                    for (dep_name, dep_version) in deps {
+                        let dep_version = dep_version.as_str().unwrap_or("");
+                        let dep_version_clean = dep_version.trim_start_matches('^').trim_start_matches('~');
+                        let match_package = packages.iter().any(|(pkg_name, _)| pkg_name == dep_name);
+                        let match_version = packages.iter().any(|(pkg_name, pkg_version)| {
+                            pkg_name == dep_name && satisfies_range(dep_version_clean, pkg_version)
+                        });
+
+                        rows_mutex.lock().unwrap().push((
+                            dep_name.to_string(),
+                            dep_version_clean.to_string(),
+                            d.to_string(),
+                            match_package,
+                            match_version,
+                            "dev".to_string(),
+                            format!("{}@{}", name, version),
+                        ));
+
+                        if match_package && match_version {
+                            found_mutex
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}:{}@{}", d, dep_name, dep_version_clean));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process lockfiles and npm ls for additional versions
         for (name, version) in &packages {
-            let rng = get_pkg_range(name, preload.pkg_json.as_ref());
+            let rng = get_pkg_range(name, pkg_json);
             let mut versions_by_file: HashMap<String, HashSet<String>> = HashMap::new();
 
             if let Some(content) = &preload.yarn {
@@ -421,7 +539,11 @@ fn main() -> io::Result<()> {
             all_versions.extend(nv.iter().cloned());
 
             let match_package = !rng.is_empty() || !all_versions.is_empty();
-            let match_version = all_versions.contains(version);
+            let match_version = all_versions.iter().any(|v| satisfies_range(v, version));
+
+            if !match_package && !match_version {
+                continue;
+            }
 
             rows_mutex.lock().unwrap().push((
                 name.clone(),
@@ -429,6 +551,8 @@ fn main() -> io::Result<()> {
                 d.to_string(),
                 match_package,
                 match_version,
+                String::new(),
+                String::new(),
             ));
 
             if match_package && match_version {
@@ -449,12 +573,28 @@ fn main() -> io::Result<()> {
 
     // Write CSV
     let mut csv_writer = csv::Writer::from_path("output.csv")?;
-    csv_writer.write_record(&["package", "version", "location", "match_package", "match_version"])?;
+    csv_writer.write_record(&[
+        "package",
+        "version",
+        "location",
+        "match_package",
+        "match_version",
+        "dependency",
+        "depended_by",
+    ])?;
 
     let mut rows = rows_mutex.into_inner().unwrap();
     rows.sort_by_key(|r| (r.0.clone(), r.1.clone(), r.2.clone()));
-    for (pkg, ver, loc, mp, mv) in rows {
-        csv_writer.write_record(&[pkg, ver, loc, mp.to_string(), mv.to_string()])?;
+    for (pkg, ver, loc, mp, mv, dep, dep_by) in rows {
+        csv_writer.write_record(&[
+            pkg,
+            ver,
+            loc,
+            mp.to_string(),
+            mv.to_string(),
+            dep,
+            dep_by,
+        ])?;
     }
 
     println!("Scan complete.");
